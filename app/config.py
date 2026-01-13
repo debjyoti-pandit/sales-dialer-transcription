@@ -16,6 +16,8 @@ class Settings(BaseModel):
     # Optional: push transcript events to your UI backend (sales-dialer-poc)
     # Example: ws://localhost:8000/ws/transcripts  OR  wss://<ngrok>/ws/transcripts
     transcript_ingest_ws_url: str = os.getenv("TRANSCRIPT_INGEST_WS_URL", "")
+    # Rule-based AMD log (JSONL) - stored for future ML use.
+    amd_log_path: str = os.getenv("AMD_LOG_PATH", "amd_decisions.jsonl")
     # Keep default aligned with docs/ngrok scripts.
     port: int = int(os.getenv("PORT", "8002"))
     log_level: str = os.getenv("LOG_LEVEL", "INFO")

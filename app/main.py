@@ -16,6 +16,7 @@ from fastapi import FastAPI, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse
 
 from app.config import settings
+from app.amd import AmdEngine
 
 
 app = FastAPI(title="sales-dialer-transcription-service")
@@ -52,6 +53,8 @@ _STATE_LOCK = asyncio.Lock()
 
 # Server->server forwarding (single shared connection).
 _FORWARD_QUEUE: "asyncio.Queue[dict[str, Any]]" = asyncio.Queue(maxsize=2000)
+
+_AMD = AmdEngine(log_path=settings.amd_log_path)
 
 
 async def _forward_loop():
@@ -105,6 +108,23 @@ async def get_call_live(call_sid: str):
                 status_code=404,
             )
         return live
+
+
+@app.get("/calls/{call_sid}/amd")
+async def get_call_amd(call_sid: str):
+    """
+    Returns current AMD state for a call (useful for debugging / call control).
+    After ~3 seconds with no decision, you'll see decision=UNKNOWN until evidence appears
+    or we hard-stop at 10 seconds.
+    """
+    st = await _AMD.get_state(call_sid)
+    if not st:
+        return Response(
+            content=json.dumps({"call_sid": call_sid, "amd": None}),
+            media_type="application/json",
+            status_code=404,
+        )
+    return {"call_sid": call_sid, "amd": st}
 
 
 @app.post("/twilio/twiml")
@@ -217,21 +237,60 @@ async def _deepgram_receiver(
                     dg_logger.info("[%s] LIVE: %s", session_id, transcript)
 
             # Update shared state keyed by CallSid (when available).
-            payload: Optional[dict[str, Any]] = None
+            call_sid = ""
+            agent_name = ""
+            phone = ""
+            call_start_monotonic: Optional[float] = None
             async with _STATE_LOCK:
-                call_sid = (_SESSION_INFO.get(session_id) or {}).get("call_sid") or ""
-                agent_name = (_SESSION_INFO.get(session_id) or {}).get("agent_name") or ""
-                phone = (_SESSION_INFO.get(session_id) or {}).get("phone") or ""
-                if call_sid:
-                    payload = {
-                        "call_sid": call_sid,
-                        "session_id": session_id,
-                        "agent_name": agent_name,
-                        "phone": phone,
-                        "transcript": transcript,
-                        "is_final": is_final,
-                        "updated_at": time.time(),
-                    }
+                si = _SESSION_INFO.get(session_id) or {}
+                call_sid = (si.get("call_sid") or "").strip()
+                agent_name = (si.get("agent_name") or "").strip()
+                phone = (si.get("phone") or "").strip()
+                csm = si.get("call_start_monotonic")
+                if isinstance(csm, (float, int)):
+                    call_start_monotonic = float(csm)
+
+            payload: Optional[dict[str, Any]] = None
+            amd_result: Optional[dict[str, Any]] = None
+            if call_sid:
+                # Rule-based AMD expects (call_id, text, timestamp_ms, duration_ms) per chunk.
+                now_m = time.monotonic()
+                if call_start_monotonic is None:
+                    # Fallback: if we didn't get a Twilio "start" (rare), use receiver time base.
+                    call_start_monotonic = now_m
+                timestamp_ms = int((now_m - call_start_monotonic) * 1000)
+                duration_ms = 0
+                if words:
+                    try:
+                        starts = [float(w.get("start")) for w in words if w.get("start") is not None]
+                        ends = [float(w.get("end")) for w in words if w.get("end") is not None]
+                        if starts and ends:
+                            duration_ms = max(0, int((max(ends) - min(starts)) * 1000))
+                    except (TypeError, ValueError):
+                        duration_ms = 0
+
+                amd_result = await _AMD.process_transcript(
+                    call_id=call_sid,
+                    text=transcript,
+                    timestamp_ms=timestamp_ms,
+                    duration_ms=duration_ms,
+                    is_final=is_final,
+                    word_items=words,
+                )
+
+                payload = {
+                    "call_sid": call_sid,
+                    "session_id": session_id,
+                    "agent_name": agent_name,
+                    "phone": phone,
+                    "transcript": transcript,
+                    "is_final": is_final,
+                    "updated_at": time.time(),
+                }
+                if amd_result:
+                    payload["amd"] = amd_result
+
+                async with _STATE_LOCK:
                     _CALL_LIVE[call_sid] = payload
 
             # Push to UI backend over websocket (best-effort)
@@ -353,6 +412,7 @@ async def twilio_media(websocket: WebSocket):
                 custom = start.get("customParameters") or {}
                 agent_name = (custom.get("agent_name") or "").strip() if isinstance(custom, dict) else ""
                 phone = (custom.get("phone") or "").strip() if isinstance(custom, dict) else ""
+                call_start_monotonic = time.monotonic()
                 logger.info(
                     "[%s] start streamSid=%s callSid=%s",
                     session_id,
@@ -365,7 +425,10 @@ async def twilio_media(websocket: WebSocket):
                         "stream_sid": stream_sid,
                         "agent_name": agent_name,
                         "phone": phone,
+                        "call_start_monotonic": call_start_monotonic,
                     }
+                if call_sid:
+                    await _AMD.start_call(call_sid)
                 continue
 
             if event == "media":
@@ -515,5 +578,11 @@ async def twilio_media(websocket: WebSocket):
             await websocket.close()
         except RuntimeError:
             pass
+
+        if call_sid:
+            try:
+                await _AMD.end_call(call_sid)
+            except Exception:  # pylint: disable=broad-exception-caught
+                logger.exception("[%s] AMD end_call failed callSid=%s", session_id, call_sid)
 
         logger.info("[%s] session closed", session_id)
